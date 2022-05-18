@@ -1,66 +1,32 @@
 import torch
 import matplotlib.pyplot as plt
+from textdataset import TextDataset
+import logging
+import torch.nn.functional as F
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class Evaluator:
-    """
-    Evaluator is used to perform evaluation along the training, keep track of it or
-    perform standart evaluation when needed.
-    """
-
-    SAMPLE_MIN = 5000
-
-    def __init__(self, model, train, test, val, labels_linear=False):
+    def __init__(self, model, data: TextDataset):
         self.model = model
-        self.X_train, self.y_train = train
-        self.X_test, self.y_test = test
-        self.X_val, self.y_val = val
-        self.labels_linear = labels_linear
+        self.data: TextDataset = data
 
         self.accuracies = {}
         self.losses = {}
 
-    def to_prediction(self, y):
-        """
-        Transform the raw model output to actual prediction
-        """
-        if not self.labels_linear:
-            return torch.argmax(y.cpu(), dim=1)
-        return torch.round(y.cpu())
-
-    def predict(self, X, to_prediction=False):
-        """
-        Infer using the model on X values
-        """
-        output, hidden = self.model(X)
-        if to_prediction:
-            return self.to_prediction(output)
-        return output
-
-    def sample(self, *args):
-        """
-        create a common sampling idx and sample the same way all values in *args
-        """
-        idx = torch.randperm(args[0].shape[0])[:self.SAMPLE_MIN]
-        return (a[idx] for a in args)
-
-    def sampleIfNeeded(self, *args):
-        """
-        Check if the args is too large, if so sample it
-        """
-        if args[0].shape[0] > self.SAMPLE_MIN:
-            return self.sample(*args)
-        return tuple(args)
-
-    def accuracy(self, X, y, set_name=None, set_train_mode=True):
-        """
-        Infer and compute the accuracy of the prediction
-        Can also keep track of it.
-        """
-        X, y = self.sampleIfNeeded(X, y)
+    def accuracy(self, X, y, set_name=None, set_train_mode=True, batch_size=None):
         self.model.eval()
-        y_pred = self.predict(X, to_prediction=True).view(y.shape[0])
-        acc = torch.sum(y_pred == self.to_prediction(y)) / y_pred.shape[0]
+        y_pred = None
+        if batch_size is not None:
+            for i in range(0, X.size(1), batch_size):
+                y_pred = self.model.predict(X[:, i:i+batch_size], to_class=True).cpu() if y_pred is None else torch.concat((y_pred, self.model.predict(X[:, i:i+batch_size], to_class=True).cpu()))
+        else:
+            y_pred = self.model.predict(X, to_class=True)
+
+        acc = torch.sum(y_pred == y.cpu()) / y_pred.shape[0]
 
         # Save accuracy in history
         if set_name is not None:
@@ -71,15 +37,20 @@ class Evaluator:
             self.model.train()
         return acc
 
-    def loss(self, X, y, criterion, set_name=None, set_train_mode=True):
-        """
-        Infer and compute the loss of the prediction
-        Can also keep track of it.
-        """
-        X, y = self.sampleIfNeeded(X, y)
+    def loss(self, X, y, criterion=None, set_name=None, set_train_mode=True, batch_size=None):
         self.model.eval()
-        y_hat = self.predict(X, to_prediction=False)
-        loss = criterion(y_hat.squeeze(), y).item()
+
+        y_hat = None
+        if batch_size is not None:
+            for i in range(0, X.size(1), batch_size):
+                y_hat = self.model.predict(X[:, i:i+batch_size], to_class=False).cpu() if y_hat is None else torch.concat((y_hat, self.model.predict(X[:, i:i+batch_size], to_class=False).cpu()))
+        else:
+            y_hat = self.model.predict(X.detach(), to_class=False).cpu()
+
+        loss = F.cross_entropy(y_hat.detach(), y.detach().cpu())
+        if criterion:
+            criterion.zero_grad()
+        loss = loss.detach()
 
         # Save loss in history
         if set_name is not None:
@@ -90,37 +61,38 @@ class Evaluator:
             self.model.train()
         return loss
 
-    def final_eval(self):
-        """
-        Perform a final evaluation of the model by computing accuracy for all sets and plotting
-        - Accuracy history of val and train sets
-        - Loss history of val and train sets
-        """
-        self.model.eval()
-        test_acc = float(self.accuracy(self.X_test, self.y_test))
-        train_acc = float(self.accuracy(self.X_train, self.y_train, set_name='train'))
-        val_acc = float(self.accuracy(self.X_val, self.y_val, set_name='val'))
+    def final_eval(self, compute_final_scores=True):
+        if compute_final_scores:
+            self.model.eval()
+            self.accuracy(*self.data.test_set, set_name='test', batch_size=500)
+            self.accuracy(*self.data.train_set_sample, set_name='train', batch_size=500)
+            self.accuracy(*self.data.val_set, set_name='val', batch_size=500)
+            self.loss(*self.data.train_set_sample, set_name='train', batch_size=500)
+            self.loss(*self.data.val_set, set_name='val', batch_size=500)
 
-        print('Test Accuracy', test_acc)
-        print('Train Accuracy', train_acc)
-        print('Val Accuracy', val_acc)
+        print('Test Accuracy', self.accuracies['test'][-1])
+        print('Train Accuracy', self.accuracies['train'][-1])
+        print('Val Accuracy', self.accuracies['val'][-1])
 
-        fig, (ax1, ax2) = plt.subplots(nrows=2, figsize=(25, 25))
+        fig, (ax1, ax2) = plt.subplots(nrows=2, figsize=(12, 12))
+
+        title_size = 15
+        label_size = 13
 
         ax1.plot(self.accuracies['train'], label='training')
         ax1.plot(self.accuracies['val'], label='validation')
         ax1.legend()
-        ax1.set_title('Accuracy over epochs')
-        ax1.set_xlabel('Epochs')
-        ax1.set_ylabel('Accuracy')
+        ax1.set_title('Accuracy over epochs', fontsize=title_size)
+        ax1.set_xlabel('Epochs', fontsize=label_size)
+        ax1.set_ylabel('Accuracy', fontsize=label_size)
 
         ax2.plot(self.losses['train'], label='training')
         ax2.plot(self.losses['val'], label='validation')
         ax2.legend()
-        ax2.set_title('Loss over epochs')
-        ax2.set_xlabel('Epochs')
-        ax2.set_ylabel('Loss')
+        ax2.set_title('Loss over epochs', fontsize=title_size)
+        ax2.set_xlabel('Epochs', fontsize=label_size)
+        ax2.set_ylabel('Loss', fontsize=label_size)
 
         plt.show()
 
-        return test_acc, train_acc, val_acc
+        return float(self.accuracies['test'][-1]), float(self.accuracies['train'][-1]), float(self.accuracies['val'][-1])
